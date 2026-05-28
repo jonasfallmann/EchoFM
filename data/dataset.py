@@ -61,6 +61,38 @@ def convert_image_to_fn(img_type, image):
         return image.convert(img_type)
     return image
 
+
+class VideoFrameTransform:
+    """Picklable video frame transform for DataLoader worker processes."""
+
+    def __init__(self, image_size, use_augmentation=False):
+        self.image_size = image_size
+        self.use_augmentation = use_augmentation
+        self.to_pil = T.ToPILImage()
+        self.resize = T.Resize(image_size)
+        self.to_tensor = T.ToTensor()
+
+    def __call__(self, img):
+        if not isinstance(img, Image.Image):
+            img = self.to_pil(img)
+
+        img = self.resize(img)
+
+        if self.use_augmentation:
+            shear_x = random.uniform(-5, 5)
+            shear_y = random.uniform(-5, 5)
+            contrast_factor = random.uniform(0.6, 1.4)
+            img = T.functional.adjust_contrast(img, contrast_factor)
+            img = T.functional.affine(
+                img,
+                angle=0,
+                translate=[0, 0],
+                scale=1.0,
+                shear=[shear_x, shear_y],
+            )
+
+        return self.to_tensor(img)
+
 # image related helpers functions and dataset
 def z_normalize(data):
     """
@@ -114,8 +146,7 @@ class ImageDataset(Dataset):
         print(f'{len(self.paths)} training samples found at {folder}')
 
         self.transform = T.Compose([
-            T.Lambda(lambda img: img.convert('RGB')
-                     if img.mode != 'RGB' else img),
+            T.Lambda(partial(convert_image_to_fn, 'RGB')),
             T.Resize(image_size),
             # T.RandomHorizontalFlip(),
             # T.CenterCrop(image_size),
@@ -400,27 +431,8 @@ class EchoDataset_from_Video_mp4(Dataset):
         self.image_size = image_size
         self.channels = channels
         
-        def apply_augmentation(img, shear_x, shear_y, contrast_factor):
-            # Apply contrast augmentation
-            img = T.functional.adjust_contrast(img, contrast_factor)
+        self.transform_for_videos = VideoFrameTransform(self.image_size, use_augmentation=False)
 
-            # # Apply shear x, y augmentation
-            img = T.functional.affine(img, angle=0, translate=[0, 0], scale=1.0, shear=[shear_x, shear_y])
-                
-            return img
-        
-        def create_transform(image_size):
-            # def transform(img, shear_x, shear_y, contrast_factor):
-            def transform(img):
-                if not isinstance(img, Image.Image):
-                    img = T.ToPILImage()(img)
-                img = T.Resize(image_size)(img)
-                # img = apply_augmentation(img, shear_x, shear_y, contrast_factor)
-                return T.ToTensor()(img)
-            return transform
-
-        self.transform_for_videos = create_transform(self.image_size)
-        
         self.transform = T.Compose([
             T.Resize(image_size),
             T.ToTensor()
@@ -500,25 +512,7 @@ class EchoDataset_from_Video(Dataset):
             cast_num_frames, frames=num_frames) if force_num_frames else identity
 
 
-        def apply_augmentation(img, shear_x, shear_y, contrast_factor):
-            # Apply contrast augmentation
-            img = T.functional.adjust_contrast(img, contrast_factor)
-
-            # # Apply shear x, y augmentation
-            img = T.functional.affine(img, angle=0, translate=[0, 0], scale=1.0, shear=[shear_x, shear_y])
-                
-            return img
-
-        def create_transform(image_size):
-            def transform(img, shear_x, shear_y, contrast_factor):
-                if not isinstance(img, Image.Image):
-                    img = T.ToPILImage()(img)
-                img = T.Resize(image_size)(img)
-                img = apply_augmentation(img, shear_x, shear_y, contrast_factor)
-                return T.ToTensor()(img)
-            return transform
-
-        self.transform_for_videos = create_transform(image_size)
+        self.transform_for_videos = VideoFrameTransform(image_size, use_augmentation=True)
         self.mp4_to_tensor = partial(
             video_to_tensor, transform=self.transform_for_videos, crop_size=self.image_size, num_frames=num_frames)
         

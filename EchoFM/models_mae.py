@@ -51,6 +51,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.cls_embed = cls_embed
         self.pred_t_dim = pred_t_dim
         self.t_pred_patch_size = t_patch_size * pred_t_dim // num_frames
+        self.embed_dim = embed_dim
 
         self.patch_embed = patch_embed(
             img_size,
@@ -163,8 +164,16 @@ class MaskedAutoencoderViT(nn.Module):
 
         self.triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2, eps=1e-7)
         self.initialize_weights()
-        
-        
+        # Freeze encoder parameters by default: we only use the encoder during evaluation/finetune
+        # and do not want decoder weights to be considered part of the encoder.
+        self.freeze_encoder()
+
+        # Print encoder parameter counts (exclude any parameter that belongs to decoder)
+        named = list(self.named_parameters())
+        decoder_names = {name for name, _ in named if "decoder" in name or "mask_token" in name}
+        encoder_param_count = sum(p.numel() for name, p in named if name not in decoder_names)
+        encoder_trainable_count = sum(p.numel() for name, p in named if name not in decoder_names and p.requires_grad)
+        print(f"Encoder parameters: {encoder_param_count:,d}; trainable: {encoder_trainable_count:,d}")
         print("model initialized")
 
     def self_similarity(self, cls_tokens):
@@ -279,6 +288,22 @@ class MaskedAutoencoderViT(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    def freeze_encoder(self):
+        """Freeze encoder parameters so they are not trainable.
+
+        This method will set requires_grad=False for all parameters that are not
+        part of the decoder (identified by the substring "decoder" or the
+        mask token). It is safe to call multiple times.
+        """
+        # Collect names first to avoid modifying during iteration
+        for name, p in list(self.named_parameters()):
+            # treat anything related to the decoder as decoder param and skip
+            if "decoder" in name or "mask_token" in name:
+                # leave decoder params untouched
+                continue
+            # otherwise freeze (encoder) params
+            p.requires_grad = False
 
     def patchify(self, imgs):
         """

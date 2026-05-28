@@ -16,16 +16,16 @@ import time
 
 # import mae_st.util.env
 
-import mae_st.util.misc as misc
+import EchoFM.util.misc as misc
 
 import numpy as np
 # import timm
 import torch
 import torch.backends.cudnn as cudnn
 from iopath.common.file_io import g_pathmgr as pathmgr
-from mae_st import models_mae
-from mae_st.engine_pretrain import train_one_epoch
-from mae_st.util.misc import NativeScalerWithGradNormCount as NativeScaler
+from EchoFM import models_mae
+from EchoFM.engine_pretrain import train_one_epoch
+from EchoFM.util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 from torch.utils.tensorboard import SummaryWriter
 from data.dataset import EchoDataset_from_Video_mp4
