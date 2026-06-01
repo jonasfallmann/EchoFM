@@ -65,14 +65,26 @@ def convert_image_to_fn(img_type, image):
 class VideoFrameTransform:
     """Picklable video frame transform for DataLoader worker processes."""
 
-    def __init__(self, image_size, use_augmentation=False):
+    def __init__(self, image_size, use_augmentation=False, norm_type="imagenet"):
         self.image_size = image_size
         self.use_augmentation = use_augmentation
         self.to_pil = T.ToPILImage()
         self.resize = T.Resize(image_size)
         self.to_tensor = T.ToTensor()
 
+        # Add normalization options
+        if norm_type == "imagenet":
+            self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        elif norm_type == "symmetric":
+            self.normalize = T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        else:
+            self.normalize = torch.nn.Identity()
+
     def __call__(self, img):
+        # 1. FIX: Convert BGR (from cv2) to RGB before PIL conversion
+        if isinstance(img, np.ndarray):
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
         if not isinstance(img, Image.Image):
             img = self.to_pil(img)
 
@@ -91,7 +103,10 @@ class VideoFrameTransform:
                 shear=[shear_x, shear_y],
             )
 
-        return self.to_tensor(img)
+        tensor = self.to_tensor(img)
+
+        # 2. FIX: Apply normalization
+        return self.normalize(tensor)
 
 # image related helpers functions and dataset
 def z_normalize(data):
@@ -431,7 +446,7 @@ class EchoDataset_from_Video_mp4(Dataset):
         self.image_size = image_size
         self.channels = channels
         
-        self.transform_for_videos = VideoFrameTransform(self.image_size, use_augmentation=False)
+        self.transform_for_videos = VideoFrameTransform(self.image_size, use_augmentation=False, norm_type="imagenet")
 
         self.transform = T.Compose([
             T.Resize(image_size),

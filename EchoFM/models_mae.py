@@ -477,11 +477,11 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x)
         x = self.norm(x)
 
-        if self.cls_embed:
-            # remove cls token
-            x = x[:, 1:, :]
-        else:
-            x = x[:, :, :]
+        # if self.cls_embed:
+        #     # remove cls token
+        #     x = x[:, 1:, :]
+        # else:
+        #     x = x[:, :, :]
 
         return x, mask, ids_restore
     

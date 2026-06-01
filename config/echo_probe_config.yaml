@@ -40,36 +40,89 @@ experiment:
     num_views_per_segment: 1     # Spatial views per segment
 
   optimization:
-    batch_size: 10
+    batch_size: 20
     num_epochs: 50
     use_bfloat16: false          # Use mixed precision training
 
     # Hyperparameter grid: train multiple probes with different settings
     # Useful for finding optimal hyperparameters
     multihead_kwargs:
-      # Configuration 1: lr=0.001, wd=0.01
       - final_lr: 0.0
         final_weight_decay: 0.01
         lr: 0.001
         start_lr: 0.001
-        warmup: 0.0
+        warmup: 0.1
         weight_decay: 0.01
-
-      # Configuration 2: lr=0.0005, wd=0.01
       - final_lr: 0.0
         final_weight_decay: 0.01
         lr: 0.0005
         start_lr: 0.0005
-        warmup: 0.0
+        warmup: 0.1
         weight_decay: 0.01
-
-      # Configuration 3: lr=0.0001, wd=0.01
       - final_lr: 0.0
         final_weight_decay: 0.01
         lr: 0.0001
         start_lr: 0.0001
-        warmup: 0.0
+        warmup: 0.1
         weight_decay: 0.01
+      - final_lr: 0.0
+        final_weight_decay: 0.01
+        lr: 0.0001
+        start_lr: 1.0e-6
+        warmup: 0.1
+        weight_decay: 0.01
+
+      # --- Group 2: weight_decay=0.1 ---
+      - final_lr: 0.0
+        final_weight_decay: 0.1
+        lr: 0.001
+        start_lr: 0.001
+        warmup: 0.1
+        weight_decay: 0.1
+      - final_lr: 0.0
+        final_weight_decay: 0.1
+        lr: 0.0005
+        start_lr: 0.0005
+        warmup: 0.1
+        weight_decay: 0.1
+      - final_lr: 0.0
+        final_weight_decay: 0.1
+        lr: 0.0001
+        start_lr: 0.0001
+        warmup: 0.1
+        weight_decay: 0.1
+      - final_lr: 0.0
+        final_weight_decay: 0.1
+        lr: 0.0001
+        start_lr: 1e-6
+        warmup: 0.1
+        weight_decay: 0.1
+
+      # --- Group 3: weight_decay=0.4 ---
+      - final_lr: 0.0
+        final_weight_decay: 0.4
+        lr: 0.001
+        start_lr: 0.001
+        warmup: 0.1
+        weight_decay: 0.4
+      - final_lr: 0.0
+        final_weight_decay: 0.4
+        lr: 0.0005
+        start_lr: 0.0005
+        warmup: 0.1
+        weight_decay: 0.4
+      - final_lr: 0.0
+        final_weight_decay: 0.4
+        lr: 0.0001
+        start_lr: 0.0001
+        warmup: 0.1
+        weight_decay: 0.4
+      - final_lr: 0.0
+        final_weight_decay: 0.1
+        lr: 0.0001
+        start_lr: 1e-6
+        warmup: 0.1
+        weight_decay: 0.1
 
 # Model configuration
 model_kwargs:
@@ -93,3 +146,7 @@ model_kwargs:
     sep_pos_embed: true
     cls_embed: true
 
+wandb:
+  enabled: true
+  project: echofm-probe-eval
+  name: echofm-base-4class-probe
