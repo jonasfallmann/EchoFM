@@ -563,88 +563,6 @@ def main(args_eval, resume_preempt=False):
     logger.info("Training completed!")
 
 
-def accumulate_collapse_stats(outputs, global_embeddings, token_similarities):
-    """
-    Accumulates batch-level statistics for collapse evaluation.
-
-    Args:
-        outputs (torch.Tensor): Encoder output tensor of shape (Batch, N, Embed_dim)
-        global_embeddings (list): List tracking pooled embeddings across batches
-        token_similarities (list): List tracking average temporal similarities
-
-    Returns:
-        tuple: Updated (global_embeddings, token_similarities)
-    """
-    with torch.no_grad():
-        # 1. Intra-Video Token Similarity (Temporal Collapse)
-        # Normalize along embedding dim
-        norm_outputs = F.normalize(outputs, p=2, dim=-1)
-        # B x N x N cosine similarity matrix
-        token_sim_matrix = torch.bmm(norm_outputs, norm_outputs.transpose(1, 2))
-
-        N = outputs.shape[1]
-        if N > 1:  # Ensure there is a temporal dimension to compare
-            mask = ~torch.eye(N, dtype=torch.bool, device=outputs.device)
-            avg_token_sim = token_sim_matrix[:, mask].mean().item()
-            token_similarities.append(avg_token_sim)
-
-        # 2. Accumulate Global Embeddings (Global Collapse)
-        # Pool temporal dimension (mean pooling)
-        pooled_outputs = outputs.mean(dim=1)  # Shape: (B, D)
-        # Move to CPU immediately to prevent GPU OOM
-        global_embeddings.append(pooled_outputs.cpu().float())
-
-    return global_embeddings, token_similarities
-
-
-def evaluate_collapse_metrics(global_embeddings, token_similarities, variance_threshold=1e-4, max_samples_sim=1000):
-    """
-    Computes final mode collapse metrics from accumulated data.
-
-    Args:
-        global_embeddings (list): Accumulated (B, D) CPU tensors
-        token_similarities (list): Accumulated token similarities
-        variance_threshold (float): Threshold to consider a channel "active"
-        max_samples_sim (int): Max samples for global similarity to avoid CPU RAM spikes
-
-    Returns:
-        dict: Dictionary of computed evaluation metrics
-    """
-    # Matrix Z of shape (M, D) where M is total accumulated samples
-    Z = torch.cat(global_embeddings, dim=0)
-    total_channels = Z.shape[1]
-
-    # A. Average Temporal/Token Similarity
-    avg_temporal_sim = (sum(token_similarities) / len(token_similarities)) if token_similarities else float('nan')
-
-    # B. Average Feature Variance (Active Channels)
-    variances = Z.var(dim=0)
-    active_channels = (variances > variance_threshold).sum().item()
-
-    # C. SVD Spectrum / Effective Rank
-    Z_centered = Z - Z.mean(dim=0)
-    # Using modern torch.linalg.svd instead of deprecated torch.svd
-    _, S, _ = torch.linalg.svd(Z_centered, full_matrices=False)
-    explained_variance = (S ** 2) / (S ** 2).sum()
-    cumulative_variance = torch.cumsum(explained_variance, dim=0)
-    # How many dimensions explain 90% of the variance?
-    dim_90 = (cumulative_variance < 0.90).sum().item() + 1
-
-    # D. Average Inter-Video Cosine Similarity
-    Z_norm = F.normalize(Z, p=2, dim=1)
-    subset_Z = Z_norm[:max_samples_sim]
-    global_sim_matrix = torch.matmul(subset_Z, subset_Z.T)
-    mask = ~torch.eye(subset_Z.shape[0], dtype=torch.bool, device=subset_Z.device)
-    avg_global_sim = global_sim_matrix[mask].mean().item()
-
-    return {
-        "temporal_similarity": avg_temporal_sim,
-        "active_channels": f"{active_channels} / {total_channels}",
-        "dim_90_variance": f"{dim_90} / {total_channels}",
-        "global_cosine_similarity": avg_global_sim
-    }
-
-
 def run_one_epoch(
     device,
     training,
@@ -672,9 +590,6 @@ def run_one_epoch(
     top1_meters = [AverageMeter() for _ in classifiers]
     subject_probs = defaultdict(list)
     subject_targets = {}
-
-    global_embeddings = []
-    token_similarities = []
 
     for itr, batch in enumerate(data_loader):
         if training:
@@ -718,12 +633,6 @@ def run_one_epoch(
                 if isinstance(encoder_output, (tuple, list)):
                     encoder_output = encoder_output[0]
 
-                global_embeddings, token_similarities = accumulate_collapse_stats(
-                    encoder_output,
-                    global_embeddings,
-                    token_similarities
-                )
-                
                 # Ensure correct shape for classifier input
                 if encoder_output.dim() == 4:
                     # (B, T, H, W) or (B, num_patches, H, W) - take mean across patches
@@ -787,13 +696,6 @@ def run_one_epoch(
                     mem_usage,
                 )
             )
-
-    metrics = evaluate_collapse_metrics(global_embeddings, token_similarities)
-    print("\n--- Foundation Model Collapse Report ---")
-    print(f"Intra-Video Temporal Similarity: {metrics['temporal_similarity']:.4f}")
-    print(f"Active Dimensions:               {metrics['active_channels']}")
-    print(f"Dims needed for 90% Variance:    {metrics['dim_90_variance']}")
-    print(f"Inter-Video Global Similarity:   {metrics['global_cosine_similarity']:.4f}")
 
     _agg_top1 = np.array([t1m.avg for t1m in top1_meters])
     subject_level_accs = None
