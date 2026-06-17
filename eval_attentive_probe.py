@@ -18,6 +18,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Dataset
 
 from attentive_probe import AttentiveClassifier
+from linear_pooler import LinearClassifier, MLPClassifier
 from data.dataset import EchoDataset_from_Video_mp4
 from EchoFM.models_mae import mae_vit_base_patch16, mae_vit_large_patch16
 
@@ -168,6 +169,8 @@ def main(args_eval, resume_preempt=False):
     probe_type = args_classifier.get("probe_type", "attentive")
     num_probe_blocks = args_classifier.get("num_probe_blocks", 1)
     num_heads = args_classifier.get("num_heads", 12)
+    use_layernorm = args_classifier.get("use_layernorm", True)
+    probe_dropout = args_classifier.get("dropout", 0.0)
 
     # -- DATA CONFIGURATION
     args_data = args_exp.get("data", {})
@@ -207,10 +210,11 @@ def main(args_eval, resume_preempt=False):
         # Start method is already set by the parent process.
         pass
 
+    cuda_device = args_eval.get("cuda_device", 0)
     if not torch.cuda.is_available():
         device = torch.device("cpu")
     else:
-        device = torch.device("cuda:0")
+        device = torch.device(f"cuda:{cuda_device}")
         torch.cuda.set_device(device)
 
     # Initialize distributed environment
@@ -281,9 +285,22 @@ def main(args_eval, resume_preempt=False):
                 num_classes=num_classes,
                 use_activation_checkpointing=True,
             ).to(device)
+        elif probe_type == "linear":
+            classifier = LinearClassifier(
+                embed_dim=embed_dim,
+                num_classes=num_classes,
+                use_layernorm=use_layernorm,
+                dropout=probe_dropout,
+            ).to(device)
+        elif probe_type == "mlp":
+            classifier = MLPClassifier(
+                embed_dim=embed_dim,
+                num_classes=num_classes,
+                use_layernorm=use_layernorm,
+                dropout=probe_dropout,
+            ).to(device)
         else:
-            # Linear probe as fallback
-            classifier = nn.Linear(embed_dim, num_classes, bias=True).to(device)
+            raise ValueError(f"Unknown probe_type: {probe_type}. Expected 'attentive', 'linear', or 'mlp'.")
 
         # Wrap with DDP for multi-GPU
         if world_size > 1:
@@ -291,7 +308,7 @@ def main(args_eval, resume_preempt=False):
 
         classifiers.append(classifier)
         if rank == 0:
-            logger.info(f"Initialized probe {i+1}/{len(opt_kwargs)}")
+            logger.info(f"Initialized {probe_type} probe {i+1}/{len(opt_kwargs)}")
 
     if rank == 0:
         logger.info(f"Sample probe architecture:\n{classifiers[0]}")
@@ -970,6 +987,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/echo_probe_config.yaml")
     parser.add_argument("--val_only", action="store_true")
+    parser.add_argument("--cuda_device", type=int, default=0, help="CUDA device index (default: 0)")
     args = parser.parse_args()
 
     # Load config
@@ -978,6 +996,8 @@ if __name__ == "__main__":
 
     if args.val_only:
         config["val_only"] = True
+
+    config["cuda_device"] = args.cuda_device
 
     # Run evaluation
     main(config)
