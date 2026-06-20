@@ -171,6 +171,7 @@ def main(args_eval, resume_preempt=False):
     num_heads = args_classifier.get("num_heads", 12)
     use_layernorm = args_classifier.get("use_layernorm", True)
     probe_dropout = args_classifier.get("dropout", 0.0)
+    probe_layer = args_classifier.get("probe_layer", -1)
 
     # -- DATA CONFIGURATION
     args_data = args_exp.get("data", {})
@@ -254,6 +255,7 @@ def main(args_eval, resume_preempt=False):
         checkpoint=checkpoint,
         device=device,
         model_kwargs=args_model,
+        probe_layer=probe_layer,
     )
 
     # Freeze encoder
@@ -643,7 +645,11 @@ def run_one_epoch(
             # Extract features from frozen encoder
             with torch.no_grad():
                 # Encoder expects (B, C, T, H, W)
-                encoder_output = encoder.forward_encoder(clips, 0)
+                # Use layer-specific forward if probing an intermediate layer
+                if hasattr(encoder, 'probe_layer'):
+                    encoder_output = encoder.forward_encoder_layer(clips, 0, encoder.probe_layer)
+                else:
+                    encoder_output = encoder.forward_encoder(clips, 0)
                 
                 # If encoder is MAE, it returns the last hidden states
                 # MAE output shape is typically (B, num_patches, embed_dim)
@@ -766,7 +772,7 @@ def _normalize_patient_ids(patient_ids, batch_size):
     return normalized[:batch_size]
 
 
-def load_encoder(model_name, checkpoint, device, model_kwargs):
+def load_encoder(model_name, checkpoint, device, model_kwargs, probe_layer=-1):
     """Load and initialize the encoder model."""
     logger.info(f"Loading encoder: {model_name}")
     
@@ -798,6 +804,28 @@ def load_encoder(model_name, checkpoint, device, model_kwargs):
     
     encoder = encoder.to(device)
 
+    # --- Layer selection for probing ---
+    num_layers = len(encoder.blocks)
+    logger.info(f"Encoder has {num_layers} transformer blocks (layers 0-{num_layers - 1})")
+
+    # Compute effective layer index (supports negative indexing like Python: -1 = last layer)
+    if probe_layer < 0:
+        effective_layer = num_layers + probe_layer
+    else:
+        effective_layer = probe_layer
+
+    # Clamp to valid range
+    if effective_layer < 0 or effective_layer >= num_layers:
+        logger.warning(
+            f"probe_layer={probe_layer} out of valid range [{-num_layers}, {num_layers - 1}], "
+            f"falling back to last layer ({num_layers - 1})"
+        )
+        effective_layer = num_layers - 1
+
+    logger.info(f"Probing at layer {effective_layer} (0-indexed) of {num_layers} total layers")
+    encoder.probe_layer = effective_layer
+    encoder.num_layers = num_layers
+
     # Load checkpoint if provided
     if checkpoint and os.path.exists(checkpoint):
         logger.info(f"Loading checkpoint from {checkpoint}")
@@ -821,8 +849,6 @@ def load_encoder(model_name, checkpoint, device, model_kwargs):
             logger.warning(f"Failed to load checkpoint: {e}")
     else:
         logger.warning("No checkpoint provided, using random initialization")
-
-
 
     return encoder
 

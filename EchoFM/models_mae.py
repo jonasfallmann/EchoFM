@@ -409,18 +409,16 @@ class MaskedAutoencoderViT(nn.Module):
 
         return x_masked, mask, ids_restore, ids_keep
 
-    def forward_encoder(self, x, mask_ratio):
-        # embed patches
+    def _embed_and_mask(self, x, mask_ratio):
+        """Common embedding + masking logic shared by forward_encoder and forward_encoder_layer."""
         x = self.patch_embed(x)
         N, T, L, C = x.shape
 
         x = x.reshape(N, T * L, C)
 
         # masking: length -> length * mask_ratio
-        # x, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio)
-        
         x, mask, ids_restore, ids_keep = self.uniform_random_masking(x, mask_ratio, L)
-        
+
         x = x.view(N, -1, C)
         # append cls token
         if self.cls_embed:
@@ -472,16 +470,29 @@ class MaskedAutoencoderViT(nn.Module):
                 )
         x = x.view([N, -1, C]) + pos_embed
 
+        return x, mask, ids_restore
+
+    def forward_encoder_layer(self, x, mask_ratio, layer_idx):
+        """
+        Forward encoder up to a specific layer (inclusive, 0-indexed), then apply norm.
+        Useful for probing intermediate representations instead of only the final layer.
+        """
+        x, mask, ids_restore = self._embed_and_mask(x, mask_ratio)
+
+        # apply Transformer blocks up to layer_idx (inclusive)
+        for blk in self.blocks[:layer_idx + 1]:
+            x = blk(x)
+        x = self.norm(x)
+
+        return x, mask, ids_restore
+
+    def forward_encoder(self, x, mask_ratio):
+        x, mask, ids_restore = self._embed_and_mask(x, mask_ratio)
+
         # apply Transformer blocks
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-
-        # if self.cls_embed:
-        #     # remove cls token
-        #     x = x[:, 1:, :]
-        # else:
-        #     x = x[:, :, :]
 
         return x, mask, ids_restore
     
