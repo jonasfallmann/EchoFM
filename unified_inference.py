@@ -30,6 +30,8 @@ from torch.utils.data import DataLoader
 from attentive_probe import AttentiveClassifier
 from linear_pooler import LinearClassifier, MLPClassifier
 from EchoFM.models_mae import mae_vit_base_patch16, mae_vit_large_patch16
+from EchoFM.util.multiclip import MulticlipEncoder
+from data.dataset import VideoFrameTransform, MulticlipVideoDataset, default_multiclip_collate
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -303,19 +305,33 @@ def run_inference(encoder, classifier, data_loader, device):
                 patient_ids = [None] * clips.shape[0]
                 video_paths = [None] * clips.shape[0]
 
-            clips = clips.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            batch_size = clips.shape[0]
+
+            # Handle single-clip vs multiclip batch format
+            if isinstance(clips, (list, tuple)) and all(isinstance(c, torch.Tensor) for c in clips):
+                # Multiclip mode: clips is a list of [B, C, T, H, W] tensors
+                batch_size = clips[0].shape[0]
+                clips = [c.to(device, non_blocking=True) for c in clips]
+            else:
+                # Single-clip mode: clips is [B, C, T, H, W]
+                clips = clips.to(device, non_blocking=True)
+                batch_size = clips.shape[0]
 
             # Normalise patient IDs
             normalized_pids = _normalize_patient_ids(patient_ids, batch_size)
 
             # Forward through frozen encoder
-            encoder_output = encoder.forward_encoder(clips, 0)
-
-            # MAE encoder output is (x, mask, ids_restore); x is (B, N_patches, embed_dim)
-            if isinstance(encoder_output, (tuple, list)):
-                encoder_output = encoder_output[0]
+            if isinstance(clips, (list, tuple)):
+                # Multiclip: encoder wrapper handles the list
+                encoder_output = encoder(clips)
+                if isinstance(encoder_output, (tuple, list)):
+                    encoder_output = encoder_output[0]
+            else:
+                # Single-clip: standard forward
+                encoder_output = encoder.forward_encoder(clips, 0)
+                # MAE encoder output is (x, mask, ids_restore); x is (B, N_patches, embed_dim)
+                if isinstance(encoder_output, (tuple, list)):
+                    encoder_output = encoder_output[0]
 
             # Ensure shape is (B, N, D) for the probe
             if encoder_output.dim() == 4:
@@ -377,6 +393,54 @@ def _normalize_patient_ids(patient_ids, batch_size):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def build_multiclip_dataset(csv_path, num_clips, frames_per_clip, frame_step,
+                            resolution, random_clip_sampling=True,
+                            allow_clip_overlap=False, filter_short_videos=False,
+                            video_folder=None):
+    """Build a MulticlipVideoDataset from a CSV label file."""
+    csv_path = str(csv_path)
+    rows = []
+    with open(csv_path, "r") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            row = [part.strip() for part in line.split(",")]
+            if row and len(row) >= 3:
+                rows.append(row)
+    if rows:
+        first_row = [str(v).strip().lower() for v in rows[0][:3]]
+        if any(k in first_row for k in
+               {"patient", "video", "path", "filepath", "filename", "sample", "class", "label", "target"}):
+            rows = rows[1:]
+
+    if video_folder is None:
+        video_folder = os.path.dirname(os.path.abspath(csv_path))
+    else:
+        video_folder = str(video_folder)
+
+    samples = []
+    for row in rows:
+        patient_id = str(row[0]).strip()
+        video_path = str(row[1]).strip()
+        label = int(float(row[2])) if len(row) > 2 else 0
+        if not os.path.isabs(video_path):
+            video_path = os.path.join(video_folder, video_path)
+        samples.append((video_path, label, patient_id))
+
+    transform = VideoFrameTransform(resolution, use_augmentation=False)
+    return MulticlipVideoDataset(
+        samples=samples,
+        transform=transform,
+        num_clips=num_clips,
+        frames_per_clip=frames_per_clip,
+        frame_step=frame_step,
+        random_clip_sampling=random_clip_sampling,
+        allow_clip_overlap=allow_clip_overlap,
+        filter_short_videos=filter_short_videos,
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -449,6 +513,11 @@ def main():
     args_data = config.get("experiment", {}).get("data", {})
     resolution = args_data.get("resolution", 224)
     frames_per_clip = args_data.get("frames_per_clip", 32)
+    num_clips = args_data.get("num_clips", 1)
+    frame_step = args_data.get("frame_step", 1)
+    allow_clip_overlap = args_data.get("allow_clip_overlap", False)
+    random_clip_sampling = args_data.get("random_clip_sampling", False)  # deterministic for eval
+    filter_short_videos = args_data.get("filter_short_videos", False)
 
     test_data_path = args.test_data_path or args_data.get("dataset_val", "")
     if not test_data_path:
@@ -457,11 +526,37 @@ def main():
     logger.info(f"Loading test data from: {test_data_path}")
 
     if test_data_path.endswith('.csv'):
-        test_dataset = EchoDatasetWithLabels(
-            test_data_path,
-            resolution=resolution,
-            num_frames=frames_per_clip,
-        )
+        if num_clips > 1:
+            test_dataset = build_multiclip_dataset(
+                test_data_path,
+                num_clips=num_clips,
+                frames_per_clip=frames_per_clip,
+                frame_step=frame_step,
+                resolution=resolution,
+                random_clip_sampling=random_clip_sampling,
+                allow_clip_overlap=allow_clip_overlap,
+                filter_short_videos=filter_short_videos,
+            )
+            collate_fn = default_multiclip_collate
+            # Wrap encoder for multiclip
+            use_temporal_pos_embed = args_data.get("use_temporal_pos_embed", False)
+            max_frames = args_data.get("max_frames", 256)
+            encoder = MulticlipEncoder(
+                encoder,
+                use_temporal_pos_embed=use_temporal_pos_embed,
+                max_frames=max_frames,
+            ).to(device)
+            encoder.eval()
+            for p in encoder.parameters():
+                p.requires_grad = False
+            logger.info(f"Wrapped encoder in MulticlipEncoder (num_clips={num_clips})")
+        else:
+            test_dataset = EchoDatasetWithLabels(
+                test_data_path,
+                resolution=resolution,
+                num_frames=frames_per_clip,
+            )
+            collate_fn = None
     else:
         # Folder-based dataset (no labels, no patient IDs)
         from data.dataset import EchoDataset_from_Video_mp4
@@ -469,6 +564,7 @@ def main():
             test_data_path,
             image_size=[resolution, resolution],
         )
+        collate_fn = None
 
     test_loader = DataLoader(
         test_dataset,
@@ -477,6 +573,7 @@ def main():
         num_workers=4,
         pin_memory=True,
         drop_last=False,
+        collate_fn=collate_fn,
     )
     logger.info(f"Test dataset size: {len(test_dataset)} samples")
 

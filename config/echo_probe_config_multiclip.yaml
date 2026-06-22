@@ -2,9 +2,9 @@
 # Example configuration for training attentive probes on EchoFM
 
 # Experiment metadata
-eval_name: attentive_probe_eval
+eval_name: attentive_probe_eval_multiclip
 tag: echofm-base-4class-probe  # Experiment tag for logging
-folder: ./outputs/              # Output folder for checkpoints and logs
+folder: ./experiments/multiclip-attentive/            # Output folder for checkpoints and logs
 num_workers: 8
 resume_checkpoint: false
 
@@ -47,7 +47,7 @@ experiment:
     # max_frames: 256              # Max frames buffer for temporal pos embed
 
   optimization:
-    batch_size: 10
+    batch_size: 12
     num_epochs: 20
     use_bfloat16: false          # Use mixed precision training
 

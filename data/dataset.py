@@ -568,5 +568,233 @@ def collate_tensors_and_strings(batch):
     return tensors, processed_ekgs
 
 
+# ---------------------------------------------------------------------------
+#  Multiclip Dataset (V-JEPA style: N clips per video)
+# ---------------------------------------------------------------------------
+
+
+def read_all_frames_mp4(path: str, transform) -> list:
+    """
+    Read all frames from an mp4 video and apply transform to each frame.
+
+    Args:
+        path: Path to the video file.
+        transform: Callable that maps a single frame (np.ndarray HxWxC BGR) to a
+                   torch tensor (C, H, W).
+
+    Returns:
+        List of transformed frame tensors, each of shape (C, H, W).
+    """
+    video = cv2.VideoCapture(path)
+    frames = []
+    while True:
+        ok, frame = video.read()
+        if not ok:
+            break
+        frame = transform(frame)
+        frames.append(frame)
+    video.release()
+    return frames
+
+
+def multiclip_video_to_tensor(
+    path: str,
+    transform,
+    num_clips: int = 3,
+    frames_per_clip: int = 16,
+    random_clip_sampling: bool = True,
+    allow_clip_overlap: bool = False,
+    frame_step: int = 1,
+    filter_short_videos: bool = False,
+):
+    """
+    Read a video and extract ``num_clips`` clips, each ``frames_per_clip`` frames.
+
+    Sampling strategy mirrors V-JEPA's VideoDataset._sample_from_vr:
+      - Partition the video into ``num_clips`` equal-length segments.
+      - From each segment, sample ``frames_per_clip`` frames with stride
+        ``frame_step`` (similar to V-JEPA's frame_step parameter).
+      - If the segment is shorter than the required clip length, padding or
+        overlap logic applies depending on ``allow_clip_overlap``.
+
+    Args:
+        path: Path to the mp4 file.
+        transform: Per-frame callable returning (C, H, W) tensor.
+        num_clips: Number of clips to extract.
+        frames_per_clip: Number of frames per clip.
+        random_clip_sampling: If True, sample a random window within each segment.
+        allow_clip_overlap: If True, clips may overlap across segment boundaries
+            when segments are too short.
+        frame_step: Temporal stride between consecutive sampled frames
+            (1 = consecutive frames).
+        filter_short_videos: If True, skip videos shorter than the required
+            total span. Returns ([], []) for skipped videos.
+
+    Returns:
+        clip_tensors: List of tensors, each of shape (C, frames_per_clip, H, W).
+        clip_indices: List of tensors, each of shape (frames_per_clip,),
+            containing the global frame indices of the sampled frames.
+    """
+    frames = read_all_frames_mp4(path, transform)
+    total_frames = len(frames)
+
+    if total_frames == 0:
+        return [], []
+
+    # Determine partition length (frames per video segment)
+    if num_clips > 1:
+        partition_len = total_frames // num_clips
+    else:
+        partition_len = total_frames
+
+    clip_len = frames_per_clip * frame_step  # number of frames spanned by one clip
+
+    if filter_short_videos and total_frames < clip_len:
+        return [], []
+
+    clip_tensors = []
+    clip_indices = []
+
+    for i in range(num_clips):
+        seg_start = i * partition_len
+        seg_end = seg_start + partition_len
+
+        if partition_len >= clip_len:
+            # Enough frames in segment: pick a random window
+            end_idx = clip_len
+            if random_clip_sampling:
+                end_idx = np.random.randint(clip_len, partition_len + 1)
+            start_idx = end_idx - clip_len
+
+            sample_positions = np.linspace(start_idx, end_idx - 1, num=frames_per_clip).astype(int)
+            indices = np.clip(sample_positions, start_idx, end_idx - 1)
+            indices = indices + seg_start
+        else:
+            # Segment too short
+            if not allow_clip_overlap:
+                # Take all available frames, pad last frame if needed
+                sample_positions = np.linspace(0, partition_len - 1, num=min(partition_len, frames_per_clip), dtype=int)
+                indices = sample_positions.copy()
+                if len(indices) < frames_per_clip:
+                    indices = np.concatenate([indices, np.full(frames_per_clip - len(indices), partition_len - 1)])
+                indices = np.clip(indices, 0, partition_len - 1)
+                indices = indices + seg_start
+            else:
+                # Allow overlap: sample across segment boundary
+                sample_len = min(clip_len, total_frames) - 1
+                sample_positions = np.linspace(0, sample_len, num=frames_per_clip, dtype=int)
+                indices = np.clip(sample_positions, 0, sample_len - 1)
+                clip_step = 0
+                if total_frames > clip_len and num_clips > 1:
+                    clip_step = (total_frames - clip_len) // (num_clips - 1)
+                indices = indices + i * clip_step
+                indices = np.clip(indices, 0, total_frames - 1)
+
+        # Gather frames
+        # NOTE: frame_step is handled via linspace above, so indices are already spaced
+        clip_frames = [frames[idx] for idx in indices]
+
+        # Stack: list of (C, H, W) -> (C, frames_per_clip, H, W)
+        clip_tensor = torch.stack(clip_frames, dim=1)
+        clip_tensors.append(clip_tensor)
+        clip_indices.append(torch.from_numpy(indices.astype(np.int64)))
+
+    return clip_tensors, clip_indices
+
+
+class MulticlipVideoDataset(Dataset):
+    """
+    Video dataset that returns ``num_clips`` clips per video.
+
+    Compatible with the V-JEPA-style ClipAggregation / MulticlipEncoder
+    processing pipeline. Each __getitem__ returns a list of clip tensors,
+    a list of clip_indices, the label, and the patient_id.
+
+    The returned tuple is:
+        (clip_tensors, label, clip_indices, patient_id)
+    where:
+        - clip_tensors: list of tensors, each (C, frames_per_clip, H, W)
+        - label: int (or float) class label
+        - clip_indices: list of tensors, each (frames_per_clip,) frame indices
+        - patient_id: str or None
+
+    Args:
+        samples: List of (video_path, label, patient_id) tuples.
+        transform: Per-frame transform callable.
+        num_clips: Number of clips per video.
+        frames_per_clip: Number of frames per clip.
+        frame_step: Temporal stride between frames.
+        random_clip_sampling: Whether to randomise clip start positions.
+        allow_clip_overlap: Whether to allow clip overlap for short videos.
+        filter_short_videos: Skip videos shorter than required span.
+    """
+
+    def __init__(
+        self,
+        samples: list,
+        transform,
+        num_clips: int = 3,
+        frames_per_clip: int = 16,
+        frame_step: int = 1,
+        random_clip_sampling: bool = True,
+        allow_clip_overlap: bool = False,
+        filter_short_videos: bool = False,
+    ):
+        super().__init__()
+        self.samples = samples  # list of (path, label, patient_id)
+        self.transform = transform
+        self.num_clips = num_clips
+        self.frames_per_clip = frames_per_clip
+        self.frame_step = frame_step
+        self.random_clip_sampling = random_clip_sampling
+        self.allow_clip_overlap = allow_clip_overlap
+        self.filter_short_videos = filter_short_videos
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        video_path, label, patient_id = self.samples[idx]
+
+        clip_tensors, clip_indices = multiclip_video_to_tensor(
+            path=str(video_path),
+            transform=self.transform,
+            num_clips=self.num_clips,
+            frames_per_clip=self.frames_per_clip,
+            random_clip_sampling=self.random_clip_sampling,
+            allow_clip_overlap=self.allow_clip_overlap,
+            frame_step=self.frame_step,
+            filter_short_videos=self.filter_short_videos,
+        )
+
+        return clip_tensors, label, clip_indices, patient_id
+
+
+def default_multiclip_collate(batch):
+    """
+    Collate function for MulticlipVideoDataset batches.
+
+    Handles the nested list structure:
+      batch[i] = (clip_tensors, label, clip_indices, patient_id)
+
+    Uses PyTorch's default_collate recursively for the nested tensor
+    structure, then appends patient_ids as a raw list.
+    """
+    from torch.utils.data import default_collate
+
+    patient_ids = [item[3] if len(item) > 3 else None for item in batch]
+
+    # Collate everything except patient_ids
+    batch_collatable = [(item[0], item[1], item[2]) for item in batch]
+    collated_clips, collated_labels, collated_indices = default_collate(batch_collatable)
+
+    # collated_clips is a list (one entry per clip position),
+    #   each entry is a stacked tensor [B, C, T, H, W]
+    # collated_indices is a list (one entry per clip position),
+    #   each entry is a stacked tensor [B, T]
+
+    return collated_clips, collated_labels, collated_indices, patient_ids
+
+
 def DataLoader(*args, **kwargs):
     return PytorchDataLoader(*args, collate_fn=collate_tensors_and_strings, **kwargs)

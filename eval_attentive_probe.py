@@ -19,8 +19,9 @@ from torch.utils.data import DataLoader, DistributedSampler, Dataset
 
 from attentive_probe import AttentiveClassifier
 from linear_pooler import LinearClassifier, MLPClassifier
-from data.dataset import EchoDataset_from_Video_mp4
+from data.dataset import EchoDataset_from_Video_mp4, VideoFrameTransform, MulticlipVideoDataset, default_multiclip_collate
 from EchoFM.models_mae import mae_vit_base_patch16, mae_vit_large_patch16
+from EchoFM.util.multiclip import MulticlipEncoder
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -180,8 +181,12 @@ def main(args_eval, resume_preempt=False):
     val_data_path = args_data.get("dataset_val", "")
     resolution = args_data.get("resolution", 224)
     num_segments = args_data.get("num_segments", 1)
+    num_clips = args_data.get("num_clips", 1)
     frames_per_clip = args_data.get("frames_per_clip", 32)
     frame_step = args_data.get("frame_step", 1)
+    allow_clip_overlap = args_data.get("allow_clip_overlap", False)
+    random_clip_sampling = args_data.get("random_clip_sampling", True)
+    filter_short_videos = args_data.get("filter_short_videos", False)
 
     # -- OPTIMIZATION CONFIGURATION
     args_opt = args_exp.get("optimization", {})
@@ -258,6 +263,18 @@ def main(args_eval, resume_preempt=False):
         probe_layer=probe_layer,
     )
 
+    # If num_clips > 1, wrap encoder in MulticlipEncoder
+    if num_clips > 1:
+        use_temporal_pos_embed = args_data.get("use_temporal_pos_embed", False)
+        max_frames = args_data.get("max_frames", 256)
+        encoder = MulticlipEncoder(
+            encoder,
+            use_temporal_pos_embed=use_temporal_pos_embed,
+            max_frames=max_frames,
+        ).to(device)
+        logger.info(f"Wrapped encoder in MulticlipEncoder (num_clips={num_clips}, "
+                    f"temporal_pos_embed={use_temporal_pos_embed})")
+
     # Freeze encoder
     for param in encoder.parameters():
         param.requires_grad = False
@@ -319,13 +336,76 @@ def main(args_eval, resume_preempt=False):
     train_sampler = None
     val_sampler = None
 
+    def _build_multiclip_dataset(csv_path, video_folder=None):
+        """Build a MulticlipVideoDataset from a CSV file."""
+        csv_path = str(csv_path)
+        rows = []
+        with open(csv_path, "r") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                row = [part.strip() for part in line.split(",")]
+                if row and len(row) >= 3:
+                    rows.append(row)
+        if rows:
+            first_row = [str(v).strip().lower() for v in rows[0][:3]]
+            if any(k in first_row for k in
+                   {"patient", "video", "path", "filepath", "filename", "sample", "class", "label", "target"}):
+                rows = rows[1:]
+
+        if video_folder is None:
+            video_folder = os.path.dirname(os.path.abspath(csv_path))
+        else:
+            video_folder = str(video_folder)
+
+        samples = []
+        for row in rows:
+            patient_id = str(row[0]).strip()
+            video_path = str(row[1]).strip()
+            label = int(float(row[2])) if len(row) > 2 else 0
+            if not os.path.isabs(video_path):
+                video_path = os.path.join(video_folder, video_path)
+            samples.append((video_path, label, patient_id))
+
+        transform = VideoFrameTransform(resolution, use_augmentation=True)
+        return MulticlipVideoDataset(
+            samples=samples,
+            transform=transform,
+            num_clips=num_clips,
+            frames_per_clip=frames_per_clip,
+            frame_step=frame_step,
+            random_clip_sampling=random_clip_sampling,
+            allow_clip_overlap=allow_clip_overlap,
+            filter_short_videos=filter_short_videos,
+        )
+
+    def _make_dataloader(dataset, sampler, shuffle, drop_last):
+        if num_clips > 1:
+            collate_fn = default_multiclip_collate
+        else:
+            collate_fn = None  # use default collate
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=(sampler is None and shuffle),
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=drop_last,
+            collate_fn=collate_fn,
+        )
+
     if train_data_path and os.path.exists(train_data_path):
         if train_data_path.endswith('.csv'):
-            train_dataset = EchoDatasetWithLabels(
-                train_data_path,
-                resolution=resolution,
-                num_frames=frames_per_clip,
-            )
+            if num_clips > 1:
+                train_dataset = _build_multiclip_dataset(train_data_path)
+            else:
+                train_dataset = EchoDatasetWithLabels(
+                    train_data_path,
+                    resolution=resolution,
+                    num_frames=frames_per_clip,
+                )
         else:
             # Fallback to folder-based dataset
             train_dataset = EchoDataset_from_Video_mp4(train_data_path, image_size=[resolution, resolution])
@@ -337,34 +417,23 @@ def main(args_eval, resume_preempt=False):
                 rank=rank,
                 shuffle=True,
             )
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                sampler=train_sampler,
-                num_workers=num_workers,
-                pin_memory=True,
-                drop_last=True,
-            )
+            train_loader = _make_dataloader(train_dataset, train_sampler, shuffle=False, drop_last=True)
         else:
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=True,
-                drop_last=True,
-            )
+            train_loader = _make_dataloader(train_dataset, None, shuffle=True, drop_last=True)
     else:
         logger.warning(f"Train data path not found: {train_data_path}")
         train_loader = None
 
     if val_data_path and os.path.exists(val_data_path):
         if val_data_path.endswith('.csv'):
-            val_dataset = EchoDatasetWithLabels(
-                val_data_path,
-                resolution=resolution,
-                num_frames=frames_per_clip,
-            )
+            if num_clips > 1:
+                val_dataset = _build_multiclip_dataset(val_data_path)
+            else:
+                val_dataset = EchoDatasetWithLabels(
+                    val_data_path,
+                    resolution=resolution,
+                    num_frames=frames_per_clip,
+                )
         else:
             # Fallback to folder-based dataset
             val_dataset = EchoDataset_from_Video_mp4(val_data_path, image_size=[resolution, resolution])
@@ -376,23 +445,9 @@ def main(args_eval, resume_preempt=False):
                 rank=rank,
                 shuffle=False,
             )
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                sampler=val_sampler,
-                num_workers=num_workers,
-                pin_memory=True,
-                drop_last=False,
-            )
+            val_loader = _make_dataloader(val_dataset, val_sampler, shuffle=False, drop_last=False)
         else:
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=True,
-                drop_last=False,
-            )
+            val_loader = _make_dataloader(val_dataset, None, shuffle=False, drop_last=False)
     else:
         logger.warning(f"Val data path not found: {val_data_path}")
         val_loader = None
@@ -619,11 +674,13 @@ def run_one_epoch(
         # Handle batch layouts from local loader or ref_videodatasetr-style loader.
         if isinstance(batch, (tuple, list)):
             if len(batch) == 4:
-                clips, labels, _, patient_ids = batch
+                clips, labels, clip_indices, patient_ids = batch
             elif len(batch) == 3:
                 clips, labels, patient_ids = batch
+                clip_indices = None
             elif len(batch) == 2:
                 clips, labels = batch
+                clip_indices = None
             else:
                 raise ValueError(f"Unsupported batch structure with length {len(batch)}")
         else:
@@ -631,10 +688,24 @@ def run_one_epoch(
             clips = batch
             batch_size = clips.shape[0] if isinstance(clips, torch.Tensor) else len(clips)
             labels = torch.randint(0, len(classifiers), (batch_size,), device=device)
+            clip_indices = None
         
         labels = labels.to(device, non_blocking=True)
-        clips = clips.to(device, non_blocking=True)
-        batch_size = clips.shape[0]
+
+        # Handle single-clip vs multiclip batch format
+        if isinstance(clips, (list, tuple)) and all(isinstance(c, torch.Tensor) for c in clips):
+            # Multiclip mode: clips is a list of [B, C, T, H, W] tensors
+            batch_size = clips[0].shape[0]
+            clips = [c.to(device, non_blocking=True) for c in clips]
+            # Move clip_indices to device as well (for temporal pos embed)
+            if clip_indices is not None:
+                clip_indices = [ci.to(device, non_blocking=True) for ci in clip_indices]
+        else:
+            # Single-clip mode: clips is [B, C, T, H, W]
+            clips = clips.to(device, non_blocking=True)
+            batch_size = clips.shape[0]
+            clip_indices = None
+
         patient_ids = _normalize_patient_ids(patient_ids, batch_size)
 
         with torch.amp.autocast(
@@ -644,27 +715,29 @@ def run_one_epoch(
         ):
             # Extract features from frozen encoder
             with torch.no_grad():
-                # Encoder expects (B, C, T, H, W)
-                # Use layer-specific forward if probing an intermediate layer
-                if hasattr(encoder, 'probe_layer'):
-                    encoder_output = encoder.forward_encoder_layer(clips, 0, encoder.probe_layer)
+                if isinstance(clips, (list, tuple)):
+                    # Multiclip: encoder wrapper handles the list
+                    encoder_output = encoder(clips, clip_indices=clip_indices)
+                    # If encoder returns a tuple, take the first element
+                    if isinstance(encoder_output, (tuple, list)):
+                        encoder_output = encoder_output[0]
                 else:
-                    encoder_output = encoder.forward_encoder(clips, 0)
-                
-                # If encoder is MAE, it returns the last hidden states
-                # MAE output shape is typically (B, num_patches, embed_dim)
-                if isinstance(encoder_output, (tuple, list)):
-                    encoder_output = encoder_output[0]
+                    # Single-clip: standard forward
+                    if hasattr(encoder, 'probe_layer'):
+                        encoder_output = encoder.forward_encoder_layer(clips, 0, encoder.probe_layer)
+                    else:
+                        encoder_output = encoder.forward_encoder(clips, 0)
+
+                    # If encoder is MAE, it returns the last hidden states
+                    if isinstance(encoder_output, (tuple, list)):
+                        encoder_output = encoder_output[0]
 
                 # Ensure correct shape for classifier input
                 if encoder_output.dim() == 4:
-                    # (B, T, H, W) or (B, num_patches, H, W) - take mean across patches
                     encoder_output = encoder_output.mean(dim=(2, 3))
                 elif encoder_output.dim() == 3:
-                    # Already (B, num_patches, embed_dim) - good
                     pass
                 elif encoder_output.dim() == 2:
-                    # (B, embed_dim) - expand to (B, 1, embed_dim)
                     encoder_output = encoder_output.unsqueeze(1)
 
             # Forward through classifiers
