@@ -534,6 +534,18 @@ def main(args_eval, resume_preempt=False):
                 torch.save(save_dict, best_path)
                 logger.info(f"Generated new best model: {best_path}")
 
+    # --- PRINT CLASSIFIER PARAMETER SUMMARY ---
+    if rank == 0:
+        logger.info("=" * 50)
+        logger.info("Classifier Parameter Summary (before training):")
+        for i, classifier in enumerate(classifiers):
+            total = sum(p.numel() for p in classifier.parameters())
+            trainable = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
+            non_trainable = total - trainable
+            logger.info(f"  Classifier {i+1}/{len(classifiers)}: "
+                        f"Total={total:,}  Trainable={trainable:,}  Non-trainable={non_trainable:,}")
+        logger.info("=" * 50)
+
     # --- INITIALIZE PER-HEAD TRACKING ---
     best_per_head = None
     sum_per_head = None
